@@ -1,0 +1,30 @@
+{
+  "work_periods": [
+    {
+      "start": "09:00",
+      "end": "12:00"
+    },
+    {
+      "start": "13:30",
+      "end": "18:30"
+    },
+    {
+      "start": "19:00",
+      "end": "21:00"
+    }
+  ],
+  "reminders": [
+    {
+      "id": "sedentary",
+      "title": "久坐提醒",
+      "interval_minutes": 60,
+      "message": "你已经坐了太久了，该起来走走了。"
+    },
+    {
+      "id": "water",
+      "title": "喝水提醒",
+      "interval_minutes": 60,
+      "message": "该喝水了，记得补充水分。"
+    }
+  ]
+}
