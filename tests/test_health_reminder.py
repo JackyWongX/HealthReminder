@@ -88,31 +88,53 @@ class ReminderEngineTests(unittest.TestCase):
     def setUp(self):
         self.engine = ReminderEngine(make_config())
 
-    def test_deadline_is_anchored_to_when_the_period_becomes_active(self):
+    def test_deadline_is_anchored_to_the_start_of_the_work_period(self):
         self.assertEqual(
             self.engine.poll(datetime(2026, 10, 15, 9, 59, 59)),
             (True, []),
         )
         self.assertEqual(
             self.engine.poll(datetime(2026, 10, 15, 10, 0)),
-            (False, []),
-        )
-        self.assertEqual(
-            self.engine.poll(datetime(2026, 10, 15, 10, 59, 59)),
             (False, ["sit", "water"]),
         )
 
-    def test_starting_late_waits_for_a_full_interval(self):
+    def test_starting_late_skips_elapsed_deadlines_and_keeps_period_cadence(self):
+        self.engine = ReminderEngine(
+            make_config(
+                reminders=[
+                    {
+                        "id": "sit",
+                        "title": "久坐提醒",
+                        "message": "起来走走",
+                        "interval_minutes": 60,
+                    },
+                    {
+                        "id": "water",
+                        "title": "喝水提醒",
+                        "message": "喝点水",
+                        "interval_minutes": 30,
+                    },
+                ]
+            )
+        )
         self.assertEqual(
-            self.engine.poll(datetime(2026, 10, 15, 10, 30)),
+            self.engine.poll(datetime(2026, 10, 15, 16, 44)),
             (True, []),
         )
         self.assertEqual(
-            self.engine.poll(datetime(2026, 10, 15, 11, 29, 59)),
+            self.engine.poll(datetime(2026, 10, 15, 16, 59, 59)),
             (False, []),
         )
         self.assertEqual(
-            self.engine.poll(datetime(2026, 10, 15, 11, 30)),
+            self.engine.poll(datetime(2026, 10, 15, 17, 0)),
+            (False, ["water"]),
+        )
+        self.assertEqual(
+            self.engine.poll(datetime(2026, 10, 15, 17, 29, 59)),
+            (False, []),
+        )
+        self.assertEqual(
+            self.engine.poll(datetime(2026, 10, 15, 17, 30)),
             (False, ["sit", "water"]),
         )
 

@@ -197,16 +197,19 @@ class ReminderEngine:
         if changed:
             self._active_period_key = period_key
             self._next_due = {}
+            period_start = datetime.combine(moment.date(), period.start)
             for reminder in self.config.reminders:
-                self._next_due[reminder.identifier] = moment + timedelta(
-                    minutes=reminder.interval_minutes
-                )
+                interval = timedelta(minutes=reminder.interval_minutes)
+                elapsed_intervals = (moment - period_start) // interval
+                self._next_due[reminder.identifier] = period_start + (
+                    elapsed_intervals + 1
+                ) * interval
         due_ids: list[str] = []
         for reminder in self.config.reminders:
             identifier = reminder.identifier
             if moment >= self._next_due[identifier]:
                 due_ids.append(identifier)
-                self._next_due[identifier] = moment + timedelta(minutes=reminder.interval_minutes)
+                self._next_due[identifier] += timedelta(minutes=reminder.interval_minutes)
         return changed, due_ids
 
     def is_active(self, moment: datetime) -> bool:
