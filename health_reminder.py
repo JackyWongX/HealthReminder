@@ -6,7 +6,6 @@ import json
 import re
 import sys
 import tkinter as tk
-from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -16,6 +15,7 @@ from typing import Any
 
 TIME_PATTERN = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d\Z")
 POLL_INTERVAL_MS = 500
+POPUP_GAP = 24
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class ReminderSpec:
     title: str
     message: str
     interval_minutes: int
+    dismiss_clicks: int
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ def parse_config(data: Any) -> AppConfig:
         title = raw_reminder.get("title")
         message = raw_reminder.get("message")
         interval = raw_reminder.get("interval_minutes")
+        dismiss_clicks = raw_reminder.get("dismiss_clicks", 3)
         if not isinstance(identifier, str) or not identifier.strip():
             raise ConfigError(f"{field}.id 必须是非空字符串")
         if identifier in identifiers:
@@ -97,9 +99,15 @@ def parse_config(data: Any) -> AppConfig:
             raise ConfigError(f"{field}.message 必须是非空字符串")
         if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
             raise ConfigError(f"{field}.interval_minutes 必须是正整数")
+        if (
+            isinstance(dismiss_clicks, bool)
+            or not isinstance(dismiss_clicks, int)
+            or dismiss_clicks <= 0
+        ):
+            raise ConfigError(f"{field}.dismiss_clicks 必须是正整数")
 
         identifiers.add(identifier)
-        reminders.append(ReminderSpec(identifier, title, message, interval))
+        reminders.append(ReminderSpec(identifier, title, message, interval, dismiss_clicks))
 
     return AppConfig(tuple(periods), tuple(reminders))
 
@@ -115,6 +123,52 @@ def load_config(path: Path) -> AppConfig:
     return parse_config(data)
 
 
+def enable_high_dpi_awareness() -> None:
+    """Prevent Windows from bitmap-scaling Tk windows on high-density displays."""
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    context = ctypes.c_void_p(-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    user32.SetProcessDpiAwarenessContext(context)
+
+
+def popup_positions(
+    screen_width: int,
+    screen_height: int,
+    popup_sizes: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return centered positions that keep simultaneous popups side by side."""
+    rows: list[list[tuple[int, int, int]]] = []
+    row_width = 0
+    for index, (width, height) in enumerate(popup_sizes):
+        extra_width = width if not rows or not rows[-1] else POPUP_GAP + width
+        if rows and rows[-1] and row_width + extra_width > screen_width:
+            rows.append([])
+            row_width = 0
+            extra_width = width
+        if not rows:
+            rows.append([])
+        rows[-1].append((index, width, height))
+        row_width += extra_width
+
+    row_heights = [max(height for _, _, height in row) for row in rows]
+    total_height = sum(row_heights) + POPUP_GAP * (len(rows) - 1)
+    y = max(0, (screen_height - total_height) // 2)
+    positions: list[tuple[int, int] | None] = [None] * len(popup_sizes)
+    for row, row_height in zip(rows, row_heights):
+        content_width = sum(width for _, width, _ in row) + POPUP_GAP * (len(row) - 1)
+        x = max(0, (screen_width - content_width) // 2)
+        for index, width, height in row:
+            positions[index] = (x, y + (row_height - height) // 2)
+            x += width + POPUP_GAP
+        y += row_height + POPUP_GAP
+
+    return [position for position in positions if position is not None]
+
+
 class ReminderEngine:
     """Track reminder deadlines independently within each work period."""
 
@@ -122,7 +176,6 @@ class ReminderEngine:
         self.config = config
         self._active_period_key: tuple[date, time, time] | None = None
         self._next_due: dict[str, datetime] = {}
-        self._outstanding: set[str] = set()
 
     def _period_at(self, moment: datetime) -> WorkPeriod | None:
         current_time = moment.time().replace(tzinfo=None)
@@ -143,42 +196,18 @@ class ReminderEngine:
         changed = period_key != self._active_period_key
         if changed:
             self._active_period_key = period_key
-            period_start = datetime.combine(moment.date(), period.start)
-            expired_before = moment - timedelta(seconds=2)
             self._next_due = {}
             for reminder in self.config.reminders:
-                interval = timedelta(minutes=reminder.interval_minutes)
-                next_due = period_start + interval
-                if next_due < expired_before:
-                    missed_intervals = (expired_before - next_due) // interval + 1
-                    next_due += missed_intervals * interval
-                self._next_due[reminder.identifier] = next_due
-            self._outstanding.clear()
-
+                self._next_due[reminder.identifier] = moment + timedelta(
+                    minutes=reminder.interval_minutes
+                )
         due_ids: list[str] = []
         for reminder in self.config.reminders:
             identifier = reminder.identifier
-            if moment >= self._next_due[identifier] and identifier not in self._outstanding:
-                self._outstanding.add(identifier)
+            if moment >= self._next_due[identifier]:
                 due_ids.append(identifier)
+                self._next_due[identifier] = moment + timedelta(minutes=reminder.interval_minutes)
         return changed, due_ids
-
-    def acknowledge(self, identifier: str, moment: datetime) -> bool:
-        """Reset one reminder only if its current work period is still active."""
-        period = self._period_at(moment)
-        if period is None or identifier not in self._outstanding:
-            return False
-
-        expected_key = (moment.date(), period.start, period.end)
-        if expected_key != self._active_period_key:
-            return False
-
-        spec = next(
-            reminder for reminder in self.config.reminders if reminder.identifier == identifier
-        )
-        self._next_due[identifier] = moment + timedelta(minutes=spec.interval_minutes)
-        self._outstanding.remove(identifier)
-        return True
 
     def is_active(self, moment: datetime) -> bool:
         period = self._period_at(moment)
@@ -187,7 +216,6 @@ class ReminderEngine:
     def _clear_period(self) -> None:
         self._active_period_key = None
         self._next_due.clear()
-        self._outstanding.clear()
 
 
 class ReminderApp:
@@ -195,10 +223,10 @@ class ReminderApp:
         self.config = config
         self.engine = ReminderEngine(config)
         self.reminders = {reminder.identifier: reminder for reminder in config.reminders}
-        self.queue: deque[str] = deque()
-        self.current_window: tk.Toplevel | None = None
-        self.current_identifier: str | None = None
+        self.active_windows: dict[str, tk.Toplevel] = {}
+        self.dismiss_click_counts: dict[str, int] = {}
 
+        enable_high_dpi_awareness()
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("健康提醒")
@@ -217,25 +245,44 @@ class ReminderApp:
         now = datetime.now()
         period_changed, due_ids = self.engine.poll(now)
         if period_changed:
-            self.queue.clear()
-            if self.current_window is not None:
-                self.current_window.destroy()
-                self.current_window = None
-                self.current_identifier = None
+            for window in self.active_windows.values():
+                window.destroy()
+            self.active_windows.clear()
+            self.dismiss_click_counts.clear()
 
-        self.queue.extend(due_ids)
-        self._show_next()
+        self._show_due(due_ids)
         self.root.after(POLL_INTERVAL_MS, self._poll)
 
-    def _show_next(self) -> None:
-        if self.current_window is not None or not self.queue:
+    def _show_due(self, due_ids: list[str]) -> None:
+        if not due_ids:
             return
         if not self.engine.is_active(datetime.now()):
             return
 
-        identifier = self.queue.popleft()
+        windows = [
+            self._create_popup(identifier)
+            for identifier in due_ids
+            if identifier not in self.active_windows
+        ]
+        if not windows:
+            return
+
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        positions = popup_positions(
+            screen_width,
+            screen_height,
+            [(window.winfo_width(), window.winfo_height()) for _, window in windows],
+        )
+        for (identifier, window), (x, y) in zip(windows, positions):
+            window.geometry(f"+{x}+{y}")
+            window.lift()
+
+    def _create_popup(self, identifier: str) -> tuple[str, tk.Toplevel]:
         reminder = self.reminders[identifier]
         window = tk.Toplevel(self.root)
+        self.active_windows[identifier] = window
+        self.dismiss_click_counts[identifier] = 0
         window.title(reminder.title)
         window.resizable(False, False)
         window.attributes("-topmost", True)
@@ -245,15 +292,20 @@ class ReminderApp:
         accent = "#287F8D" if is_water_reminder else "#358264"
         accent_hover = "#216B78" if is_water_reminder else "#2A6D53"
 
-        screen_width = window.winfo_screenwidth()
-        message_font = tkfont.Font(root=window, family="Microsoft YaHei UI", size=14)
-        button_font = tkfont.Font(root=window, family="Microsoft YaHei UI", size=11, weight="bold")
+        scale = max(1.0, window.winfo_fpixels("1i") / 96)
+        message_font = tkfont.Font(
+            root=window, family="Microsoft YaHei UI", size=round(14 * scale)
+        )
+        button_font = tkfont.Font(
+            root=window, family="Microsoft YaHei UI", size=round(11 * scale), weight="bold"
+        )
         message_width = message_font.measure(reminder.message)
         button_width = button_font.measure("我知道了") + 32
         content_width = max(message_width, button_width, 200)
-        max_popup_width = max(280, min(680, screen_width - 48))
-        popup_width = min(max_popup_width, max(340, content_width + 72))
-        message_wrap = max(1, min(message_width + 1, popup_width - 72))
+        screen_width = window.winfo_screenwidth()
+        max_popup_width = max(round(280 * scale), min(round(680 * scale), screen_width - 48))
+        popup_width = min(max_popup_width, max(round(340 * scale), content_width + round(72 * scale)))
+        message_wrap = max(1, min(message_width + 1, popup_width - round(72 * scale)))
 
         outer = tk.Frame(window, bg="#F1F6F2", padx=12, pady=12)
         outer.pack(fill="both", expand=True)
@@ -285,8 +337,8 @@ class ReminderApp:
 
         button = tk.Button(
             content,
-            text="我知道了",
-            command=lambda: self._acknowledge(identifier),
+            text=self._dismiss_button_text(identifier),
+            command=lambda: self._record_dismiss_click(identifier, window, button),
             bg=accent,
             fg="#FFFFFF",
             activebackground=accent_hover,
@@ -303,28 +355,40 @@ class ReminderApp:
         button.pack(fill="x")
         button.bind("<Enter>", lambda _event: button.configure(bg=accent_hover))
         button.bind("<Leave>", lambda _event: button.configure(bg=accent))
-        window.protocol("WM_DELETE_WINDOW", lambda: self._acknowledge(identifier))
+        window.protocol("WM_DELETE_WINDOW", lambda: None)
         window.update_idletasks()
         window.geometry(f"{popup_width}x{window.winfo_reqheight()}")
         window.update_idletasks()
-        x = max(0, (window.winfo_screenwidth() - window.winfo_width()) // 2)
-        y = max(0, (window.winfo_screenheight() - window.winfo_height()) // 2)
-        window.geometry(f"+{x}+{y}")
-        window.bind("<Return>", lambda _event: self._acknowledge(identifier))
-        window.bind("<Escape>", lambda _event: self._acknowledge(identifier))
-        window.grab_set()
-        window.lift()
+        window.bind("<Return>", lambda _event: self._record_dismiss_click(identifier, window, button))
+        window.bind("<Escape>", lambda _event: None)
+        return identifier, window
 
-        self.current_window = window
-        self.current_identifier = identifier
+    def _dismiss_button_text(self, identifier: str) -> str:
+        clicks = self.dismiss_click_counts[identifier]
+        required_clicks = self.reminders[identifier].dismiss_clicks
+        return f"我知道了（{clicks}/{required_clicks}）"
 
-    def _acknowledge(self, identifier: str) -> None:
-        self.engine.acknowledge(identifier, datetime.now())
-        if self.current_window is not None:
-            self.current_window.destroy()
-        self.current_window = None
-        self.current_identifier = None
-        self._show_next()
+    def _record_dismiss_click(
+        self,
+        identifier: str,
+        window: tk.Toplevel,
+        button: tk.Button,
+    ) -> None:
+        if self.active_windows.get(identifier) is not window:
+            return
+
+        self.dismiss_click_counts[identifier] += 1
+        if self.dismiss_click_counts[identifier] >= self.reminders[identifier].dismiss_clicks:
+            self._dismiss(identifier, window)
+            return
+        button.configure(text=self._dismiss_button_text(identifier))
+
+    def _dismiss(self, identifier: str, window: tk.Toplevel) -> None:
+        if self.active_windows.get(identifier) is not window:
+            return
+        window.destroy()
+        del self.active_windows[identifier]
+        del self.dismiss_click_counts[identifier]
 
 
 def main() -> int:

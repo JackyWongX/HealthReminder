@@ -1,7 +1,7 @@
 {
   "work_periods": [
     {
-      "start": "09:00",
+      "start": "09:30",
       "end": "12:00"
     },
     {
@@ -18,12 +18,14 @@
       "id": "sedentary",
       "title": "久坐提醒",
       "interval_minutes": 60,
+      "dismiss_clicks": 3,
       "message": "你已经坐了太久了，该起来走走了。"
     },
     {
       "id": "water",
       "title": "喝水提醒",
-      "interval_minutes": 60,
+      "interval_minutes": 30,
+      "dismiss_clicks": 3,
       "message": "该喝水了，记得补充水分。"
     }
   ]
